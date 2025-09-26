@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crossbeam::channel;
 
+#[derive(Clone)]
 struct StatusQueue {
     dest: channel::Sender<Event>,
     only_new_client: bool,
@@ -285,7 +286,14 @@ impl ProxyCore {
             return true;
         }
         let (port_rx_send, port_rx) = HardwarePort::rx_channel();
-        let port = match HardwarePort::new(&self.url, HardwarePort::rx_to_channel(port_rx_send)) {
+        let status_queue = self.status_queue.clone();
+        let port = match HardwarePort::new(
+            &self.url,
+            HardwarePort::rx_to_channel(port_rx_send),
+            move |dropped| {
+                status_queue.send(Event::PortRxDrop(dropped.len()));
+            },
+        ) {
             Ok(p) => p,
             Err(_) => {
                 return false;

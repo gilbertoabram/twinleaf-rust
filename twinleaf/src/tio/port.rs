@@ -209,10 +209,13 @@ pub struct Port {
 }
 
 /// Default size of the rx channel when receiving to a crossbeam channel.
-pub static DEFAULT_RX_CHANNEL_SIZE: usize = 256;
+pub const DEFAULT_RX_CHANNEL_SIZE: usize = 1024;
 
 /// Default size of the tx channel when sending to a crossbeam channel.
-pub static DEFAULT_TX_CHANNEL_SIZE: usize = 64;
+pub const DEFAULT_TX_CHANNEL_SIZE: usize = 256;
+
+/// Maximum time to wait before giving up sending a packet on a channel.
+const MAX_CHANNEL_WAIT: Duration = Duration::from_millis(50);
 
 impl Port {
     /// Method running the `Port` thread event loop. It bridges `mio` and
@@ -220,13 +223,15 @@ impl Port {
     /// heartbeats, and startup holdoff logic.
     fn poller_thread<
         RawPortT: RawPort + mio::event::Source,
-        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()>,
+        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> (),
     >(
         mut raw_port: RawPortT,
         mut poll: mio::Poll,
         rx: RxCallbackT,
         tx: crossbeam::channel::Receiver<PacketOrControl>,
         ctl_result: crossbeam::channel::Sender<ControlResult>,
+        drop_cb: DropCallbackT,
     ) {
         use crossbeam::channel::TryRecvError;
 
@@ -337,14 +342,28 @@ impl Port {
                             }
                         }
                         // Packet or error available from the device
+                        let mut dropped = Vec::new();
                         loop {
                             match raw_port.recv() {
                                 Ok(pkt) => {
-                                    if startup {
-                                        // Ignore this packet
-                                    } else if let Err(_) = rx(Ok(pkt)) {
-                                        // RX callback signaled an error, terminate.
-                                        break 'ioloop;
+                                    if startup || !dropped.is_empty() {
+                                        // Ignore all packets during startup, or continue draining
+                                        // if we dropped as long as there is data.
+                                        dropped.push(Ok(pkt));
+                                    } else {
+                                        match rx(Ok(pkt)) {
+                                            Ok(None) => {
+                                                // Packet was enqueued successfully
+                                            }
+                                            Ok(Some(dropped_pkt)) => {
+                                                // The queue was full. drain the port queue
+                                                dropped.push(dropped_pkt);
+                                            }
+                                            Err(_) => {
+                                                // RX callback signaled an error, terminate.
+                                                break 'ioloop;
+                                            }
+                                        }
                                     }
                                 }
                                 Err(RecvError::NotReady) => {
@@ -368,11 +387,33 @@ impl Port {
                                         } else {
                                             startup
                                         };
-                                    if (!ignore && rx(Err(e)).is_err()) || disconnect {
+                                    if !ignore {
+                                        if !dropped.is_empty() {
+                                            dropped.push(Err(e));
+                                        } else {
+                                            match rx(Err(e)) {
+                                                Ok(None) => {
+                                                    // Error was enqueued successfully
+                                                }
+                                                Ok(Some(dropped_err)) => {
+                                                    // The queue was full. drain the port queue
+                                                    dropped.push(dropped_err);
+                                                }
+                                                Err(_) => {
+                                                    // RX callback signaled an error, terminate.
+                                                    break 'ioloop;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if disconnect {
                                         break 'ioloop;
                                     }
                                 }
                             };
+                        }
+                        if !dropped.is_empty() {
+                            drop_cb(dropped);
                         }
                     }
                     mio::Token(x) => {
@@ -440,11 +481,15 @@ impl Port {
     /// tx channel size.
     fn from_raw_custom<
         RawPortT: RawPort + mio::event::Source + Send + 'static,
-        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
     >(
         raw_port: RawPortT,
         rx: RxCallbackT,
         tx_size: usize,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
         let rates = raw_port.rate_info();
         let (tx, ttx) = crossbeam::channel::bounded::<PacketOrControl>(std::cmp::max(
@@ -468,7 +513,7 @@ impl Port {
             // to the thread method, and retain ownership to manually drop.
             // Since the issue is minor, it is left unaddressed, with the hope that
             // the windows implementation of mio_serial will fix this eventually.
-            Port::poller_thread(raw_port, poll, rx, ttx, ctl_ret_sender);
+            Port::poller_thread(raw_port, poll, rx, ttx, ctl_ret_sender, drop_cb);
         });
         io::Result::Ok(Port {
             tx: Some(Box::new(tx)),
@@ -481,12 +526,16 @@ impl Port {
     /// Create a `Port` from a `RawPort` and a rx callback.
     fn from_raw<
         RawPortT: RawPort + mio::event::Source + Send + 'static,
-        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RxCallbackT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
     >(
         raw_port: RawPortT,
         rx: RxCallbackT,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
-        Self::from_raw_custom(raw_port, rx, DEFAULT_RX_CHANNEL_SIZE)
+        Self::from_raw_custom(raw_port, rx, DEFAULT_RX_CHANNEL_SIZE, drop_cb)
     }
 
     /// Creates a new `Port` for the physical device at `url`, sending the received
@@ -503,48 +552,62 @@ impl Port {
     ///
     /// The RX callback is called from the thread with the result of a `recv` operation
     /// on the underlying raw port. If it returns an `Err()`, the port is closed.
+    /// It it returns Ok(Some(x)), then it means that it could not receive x
+    /// temporarily (e.g. due to a full queue).
     ///
     /// The most common use for a `Port` is to receive on a channel, see `rx_to_channel_cb`.
-    pub fn new<RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static>(
+    pub fn new<
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
+    >(
         url: &str,
         rx: RXT,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
         // Special case: serial ports can be given directly
         #[cfg(unix)]
         if url.starts_with("/dev/") {
-            return Port::from_raw(serial::Port::new(url)?, rx);
+            return Port::from_raw(serial::Port::new(url)?, rx, drop_cb);
         }
         #[cfg(windows)]
         if url.starts_with("COM") {
-            return Port::from_raw(serial::Port::new(url)?, rx);
+            return Port::from_raw(serial::Port::new(url)?, rx, drop_cb);
         }
 
         let split_url: Vec<&str> = url.splitn(2, "://").collect();
         match split_url[..] {
-            ["serial", port] => Port::from_raw(serial::Port::new(port)?, rx),
+            ["serial", port] => Port::from_raw(serial::Port::new(port)?, rx, drop_cb),
             ["tcp", addr] => Port::from_raw(
                 tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::Either)?)?,
                 rx,
+                drop_cb,
             ),
             ["udp", addr] => Port::from_raw(
                 udp::Port::new(&find_addr(addr, AddrFamilyRestrict::Either)?)?,
                 rx,
+                drop_cb,
             ),
             ["tcp4", addr] => Port::from_raw(
                 tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::V4)?)?,
                 rx,
+                drop_cb,
             ),
             ["udp4", addr] => Port::from_raw(
                 udp::Port::new(&find_addr(addr, AddrFamilyRestrict::V4)?)?,
                 rx,
+                drop_cb,
             ),
             ["tcp6", addr] => Port::from_raw(
                 tcp::Port::new(&find_addr(addr, AddrFamilyRestrict::V6)?)?,
                 rx,
+                drop_cb,
             ),
             ["udp6", addr] => Port::from_raw(
                 udp::Port::new(&find_addr(addr, AddrFamilyRestrict::V6)?)?,
                 rx,
+                drop_cb,
             ),
             _ => io::Result::Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid url")),
         }
@@ -552,46 +615,62 @@ impl Port {
 
     /// Create a new port from a `mio::net::TcpStream`. See `new()`.
     pub fn from_mio_stream<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
     >(
         stream: mio::net::TcpStream,
         rx: RXT,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
-        Port::from_raw(tcp::Port::from_stream(stream)?, rx)
+        Port::from_raw(tcp::Port::from_stream(stream)?, rx, drop_cb)
     }
 
     /// Create a new port from a `std::net::TcpStream`. See `new()`.
     pub fn from_tcp_stream<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
     >(
         stream: std::net::TcpStream,
         rx: RXT,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
         stream.set_nonblocking(true)?;
-        Port::from_mio_stream(mio::net::TcpStream::from_std(stream), rx)
+        Port::from_mio_stream(mio::net::TcpStream::from_std(stream), rx, drop_cb)
     }
 
     /// Same as `from_mio_stream`, but with configurable tx channel size.
     pub fn from_mio_stream_custom<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
     >(
         stream: mio::net::TcpStream,
         rx: RXT,
         tx_size: usize,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
-        Port::from_raw_custom(tcp::Port::from_stream(stream)?, rx, tx_size)
+        Port::from_raw_custom(tcp::Port::from_stream(stream)?, rx, tx_size, drop_cb)
     }
 
     /// Same as `from_tcp_stream`, but with configurable tx channel size.
     pub fn from_tcp_stream_custom<
-        RXT: Fn(Result<Packet, RecvError>) -> io::Result<()> + Send + 'static,
+        RXT: Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>>
+            + Send
+            + 'static,
+        DropCallbackT: Fn(Vec<Result<Packet, RecvError>>) -> () + Send + 'static,
     >(
         stream: std::net::TcpStream,
         rx: RXT,
         tx_size: usize,
+        drop_cb: DropCallbackT,
     ) -> io::Result<Port> {
         stream.set_nonblocking(true)?;
-        Port::from_mio_stream_custom(mio::net::TcpStream::from_std(stream), rx, tx_size)
+        Port::from_mio_stream_custom(mio::net::TcpStream::from_std(stream), rx, tx_size, drop_cb)
     }
 
     /// Creates a sender/receiver pair to be used with `rx_to_channel`:
@@ -608,15 +687,6 @@ impl Port {
         Port::rx_channel_custom(DEFAULT_RX_CHANNEL_SIZE)
     }
 
-    /// Returns a RX callback which sends the received results to a channel
-    /// (see `rx_channel`) and silently drops results when the channel
-    /// is full.
-    pub fn rx_to_channel(
-        rx_send: crossbeam::channel::Sender<Result<Packet, RecvError>>,
-    ) -> impl Fn(Result<Packet, RecvError>) -> io::Result<()> {
-        Port::rx_to_channel_cb(rx_send, |_| {})
-    }
-
     /// Same as `rx_channel`, but with user specified size.
     pub fn rx_channel_custom(
         size: usize,
@@ -627,30 +697,27 @@ impl Port {
         crossbeam::channel::bounded::<Result<Packet, RecvError>>(size)
     }
 
-    /// Same as `rx_to_channel`, but with a user specified callback for when
-    /// the channel is full.
-    pub fn rx_to_channel_cb<FullCBT: Fn(Result<Packet, RecvError>) -> () + Send + 'static>(
+    /// Returns a RX callback which sends the received results to a channel
+    /// (see `rx_channel`). Returns Ok(true) if the packet was enqueued,
+    /// Ok(false) if not because the channel is full, and an error otherwise.
+    pub fn rx_to_channel(
         rx_send: crossbeam::channel::Sender<Result<Packet, RecvError>>,
-        full_cb: FullCBT,
-    ) -> impl Fn(Result<Packet, RecvError>) -> io::Result<()> {
-        move |rxdata| -> io::Result<()> {
+    ) -> impl Fn(Result<Packet, RecvError>) -> io::Result<Option<Result<Packet, RecvError>>> {
+        move |rxdata| -> io::Result<Option<Result<Packet, RecvError>>> {
             if let Err(RecvError::Disconnected) = rxdata {
                 return Err(io::Error::from(io::ErrorKind::BrokenPipe));
             }
-            use crossbeam::channel::TrySendError;
-            match rx_send.try_send(rxdata) {
-                Err(TrySendError::Full(res)) => {
-                    full_cb(res);
-                    Ok(())
-                }
+            use crossbeam::channel::SendTimeoutError;
+            match rx_send.send_timeout(rxdata, MAX_CHANNEL_WAIT) {
+                Err(SendTimeoutError::Timeout(res)) => Ok(Some(res)),
                 Err(e) => {
-                    if let TrySendError::Disconnected(_) = e {
+                    if let SendTimeoutError::Disconnected(_) = e {
                         Err(io::Error::from(io::ErrorKind::BrokenPipe))
                     } else {
                         Err(io::Error::from(io::ErrorKind::Other))
                     }
                 }
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(None),
             }
         }
     }

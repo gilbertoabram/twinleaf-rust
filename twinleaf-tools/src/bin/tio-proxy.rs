@@ -319,7 +319,7 @@ fn main() -> ExitCode {
                     // for rx and tx are inverted. Also, we use the proxy port channel size setting
                     // instead of the physical ports setting.
                     let (rx_send, client_rx) = tio::port::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
-                    let client = match tio::port::Port::from_tcp_stream_custom(stream, tio::port::Port::rx_to_channel(rx_send), proxy::Interface::get_client_rx_channel_size()) {
+                    let client = match tio::port::Port::from_tcp_stream_custom(stream, tio::port::Port::rx_to_channel(rx_send), proxy::Interface::get_client_rx_channel_size(), |_| {}) {
                         Ok(client_port) => client_port,
                         _ => continue,
                     };

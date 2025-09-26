@@ -51,6 +51,7 @@ pub enum Event {
     AutoRateSet(u32),
     SetRate(u32),
     SetRateFailed,
+    PortRxDrop(usize),
     NoData,
 }
 

@@ -37,10 +37,10 @@ pub struct Port {
 }
 
 /// Default data rate on the serial port.
-static DEFAULT_RATE: u32 = 115200;
+const DEFAULT_RATE: u32 = 115200;
 
 /// Discard anything for this long after the port is opened.
-static HOLDOFF_TIME: Duration = Duration::from_millis(50);
+const HOLDOFF_TIME: Duration = Duration::from_millis(50);
 
 impl Port {
     /// Returns a new `tcp::Port`. The `url` should look like
@@ -96,6 +96,8 @@ impl Port {
             if unsafe { SetCommTimeouts(handle, &mut timeouts) } == 0 {
                 return Err(io::Error::last_os_error());
             }
+            // Increase the serial buffer size
+            winapi::um::commapi::SetupComm(handle, 64 * 1024, 64 * 1024);
         }
         Ok(Port {
             port: mio_port,
