@@ -250,6 +250,15 @@ impl Port {
 
         let mut startup = raw_port.startup_holdoff();
 
+        let rt_handle =
+            match audio_thread_priority::promote_current_thread_to_real_time(2400, 48000) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("Error promoting thread to real-time: {}", e);
+                    None
+                }
+            };
+
         'ioloop: loop {
             let timeout = if needs_draining {
                 None
@@ -474,6 +483,11 @@ impl Port {
                     }
                 }
             }
+        }
+
+        if let Some(h) = rt_handle {
+            // The thread is terminating anyway, even if this fails for some reason
+            let _ = audio_thread_priority::demote_current_thread_from_real_time(h);
         }
     }
 
